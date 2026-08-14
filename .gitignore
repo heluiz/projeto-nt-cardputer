@@ -1,0 +1,19 @@
+# Build do PlatformIO (centenas de MB, nunca vai para o repositorio)
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# Binarios compilados: use os Releases do GitHub, nao o versionamento
+*.bin
+*.elf
+*.hex
+
+# Configuracao local com credenciais reais
+trader.txt
+CardputerBridge.cfg
+
+# Ambiente
+.vscode/.browse.c_cpp.db*
+.vscode/ipch/
+.DS_Store
+Thumbs.db

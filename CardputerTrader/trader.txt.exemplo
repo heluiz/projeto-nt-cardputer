@@ -1,0 +1,7 @@
+# Copie este arquivo para a RAIZ do cartao SD com o nome trader.txt
+# Linhas comecando com # sao ignoradas.
+
+ssid=NomeDaSuaRedeWifi
+pass=SenhaDaSuaRedeWifi
+host=192.168.0.15
+port=8088

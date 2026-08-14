@@ -1,0 +1,3 @@
+# Este arquivo foi movido para /.github/workflows/build.yml na raiz do repositorio.
+# O GitHub Actions so le workflows a partir da raiz, entao este aqui e inerte.
+# Pode apagar a pasta CardputerTrader/.github com seguranca.
