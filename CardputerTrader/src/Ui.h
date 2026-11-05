@@ -25,6 +25,34 @@ inline uint16_t colorFor(float v) { return (v > 0) ? C_UP : (v < 0 ? C_DN : C_DI
 //  Elementos pequenos
 // ===============================================================
 
+// alto-falante: mudo, so posicao, ou tudo
+inline void drawSoundIcon(M5Canvas &g, int x, int y, int mode)
+{
+    uint16_t col = (mode <= 0) ? C_DN : (mode == 1 ? C_DIM : C_UP);
+
+    // corpo e cone
+    g.fillRect(x, y + 3, 2, 3, col);
+    g.fillTriangle(x + 2, y + 6, x + 5, y + 1, x + 5, y + 8, col);
+
+    if (mode <= 0) {
+        // risco atravessando: mudo
+        g.drawLine(x + 6, y + 1, x + 10, y + 7, C_DN);
+        g.drawLine(x + 6, y + 7, x + 10, y + 1, C_DN);
+    } else {
+        // uma onda para posicao, duas para tudo
+        g.drawPixel(x + 7, y + 3, col);
+        g.drawPixel(x + 7, y + 4, col);
+        g.drawPixel(x + 7, y + 5, col);
+        if (mode >= 2) {
+            g.drawPixel(x + 9, y + 2, col);
+            g.drawPixel(x + 10, y + 3, col);
+            g.drawPixel(x + 10, y + 4, col);
+            g.drawPixel(x + 10, y + 5, col);
+            g.drawPixel(x + 9, y + 6, col);
+        }
+    }
+}
+
 inline void drawBatteryIcon(M5Canvas &g, int x, int y, int pct, uint16_t bg)
 {
     uint16_t col = (pct <= 15) ? C_DN : (pct <= 35 ? C_ACC2 : C_DIM);
@@ -63,31 +91,36 @@ inline void drawTickArrow(M5Canvas &g, int x, int y, int tick)
     }
 }
 
-// faixa com todos os contratos, o ativo em destaque
+// Faixa superior: nome completo do contrato ativo, seguido de um
+// marcador por contrato. Antes eu escrevia todos os nomes e o ultimo
+// nao cabia; com marcadores cabem ate dez sem cortar nenhum.
 inline void drawStrip(M5Canvas &g, const Snapshot &s, int active, int wRight)
 {
     g.setFont(&fonts::Font0);
     g.setTextSize(1);
 
-    int x = 3;
+    const char *nome = (s.n > 0) ? s.q[active].sym : "sem contrato";
+    g.setTextColor(C_ACC, C_BG);
+    g.drawString(nome, 3, 1);
+
+    int x = 3 + g.textWidth(nome) + 9;
     int limit = 240 - wRight;
 
     for (int i = 0; i < s.n; i++) {
-        char r[6];
-        snprintf(r, sizeof(r), "%.4s", s.q[i].root[0] ? s.q[i].root : s.q[i].sym);
-        int w = g.textWidth(r);
-        if (x + w + 6 > limit) break;
-
-        if (i == active) {
-            g.fillRect(x - 2, 0, w + 4, 10, C_ACC);
-            g.setTextColor(C_BG, C_ACC);
-        } else {
-            g.setTextColor(colorFor(s.q[i].pct), C_BG);
+        if (x + 6 > limit) {
+            g.setTextColor(C_DIM, C_BG);
+            g.drawString("+", x, 1);
+            break;
         }
-        g.drawString(r, x, 1);
 
-        if (s.q[i].alert) g.fillRect(x - 2, 9, w + 4, 1, C_ACC2);
-        x += w + 7;
+        uint16_t col = colorFor(s.q[i].pct);
+        if (i == active) g.fillRect(x, 1, 5, 8, col);
+        else             g.drawRect(x, 2, 5, 6, col);
+
+        if (s.q[i].alert && (millis() / 400) % 2 == 0)
+            g.fillRect(x - 1, 10, 7, 1, C_ACC2);
+
+        x += 7;
     }
 }
 
@@ -190,7 +223,7 @@ inline void drawAlertFrame(M5Canvas &g, bool on)
 // ===============================================================
 //  Tela 1: painel
 // ===============================================================
-inline void drawDashboard(M5Canvas &g, const Snapshot &s, int idx, bool connOk, int bat, uint32_t ageMs)
+inline void drawDashboard(M5Canvas &g, const Snapshot &s, int idx, bool connOk, int bat, uint32_t ageMs, int som)
 {
     const Quote &q = s.q[idx];
     bool stale = !connOk;
@@ -199,17 +232,18 @@ inline void drawDashboard(M5Canvas &g, const Snapshot &s, int idx, bool connOk, 
     g.fillScreen(C_BG);
 
     // ---- faixa de contratos + status ----
-    drawStrip(g, s, idx, 92);
+    drawStrip(g, s, idx, 104);
 
     g.setFont(&fonts::Font0);
     char pc[16];
     snprintf(pc, sizeof(pc), "%+.2f%%", q.pct);
     int pw = g.textWidth(pc);
     g.setTextColor(stale ? C_DIM : colorFor(q.pct), C_BG);
-    g.drawString(pc, 186 - pw, 1);
+    g.drawString(pc, 174 - pw, 1);
 
+    drawSoundIcon(g, 178, 1, som);
     drawWifiBars(g, 192, 1, (int)WiFi.RSSI(), WiFi.status() == WL_CONNECTED);
-    drawBatteryIcon(g, 208, 1, bat, C_BG);
+    drawBatteryIcon(g, 206, 1, bat, C_BG);
 
     // ---- preco ----
     // A fonte NUNCA muda dentro de um tema. Se o numero nao couber,
@@ -310,19 +344,20 @@ inline void drawDashboard(M5Canvas &g, const Snapshot &s, int idx, bool connOk, 
 //  Tela 2: grafico em tela cheia
 // ===============================================================
 inline void drawChart(M5Canvas &g, const Snapshot &s, int idx, const DayHist &day,
-                      bool dayMode, bool connOk, int bat)
+                      bool dayMode, bool connOk, int bat, int som)
 {
     const Quote &q = s.q[idx];
 
     g.fillScreen(C_BG);
-    drawStrip(g, s, idx, 92);
+    drawStrip(g, s, idx, 104);
 
     g.setFont(&fonts::Font0);
     const char *mode = dayMode ? "SESSAO" : "10 MIN";
     g.setTextColor(C_ACC, C_BG);
-    g.drawString(mode, 186 - g.textWidth(mode), 1);
+    g.drawString(mode, 174 - g.textWidth(mode), 1);
+    drawSoundIcon(g, 178, 1, som);
     drawWifiBars(g, 192, 1, (int)WiFi.RSSI(), WiFi.status() == WL_CONNECTED);
-    drawBatteryIcon(g, 208, 1, bat, C_BG);
+    drawBatteryIcon(g, 206, 1, bat, C_BG);
 
     if (dayMode) {
         if (day.loading) {
@@ -356,15 +391,19 @@ inline void drawChart(M5Canvas &g, const Snapshot &s, int idx, const DayHist &da
 // ===============================================================
 //  Tela 3: grade com todos os contratos
 // ===============================================================
-inline void drawGrid(M5Canvas &g, const Snapshot &s, int active, bool connOk, int bat)
+inline void drawGrid(M5Canvas &g, const Snapshot &s, int active, bool connOk, int bat, int som)
 {
     g.fillScreen(C_BG);
 
     g.setFont(&fonts::Font0);
     g.setTextColor(C_ACC, C_BG);
-    g.drawString("CONTRATOS", 4, 1);
+    char gt[28];
+    if (s.n > 8) snprintf(gt, sizeof(gt), "CONTRATOS  8 de %d", s.n);
+    else         snprintf(gt, sizeof(gt), "CONTRATOS");
+    g.drawString(gt, 4, 1);
+    drawSoundIcon(g, 178, 1, som);
     drawWifiBars(g, 192, 1, (int)WiFi.RSSI(), WiFi.status() == WL_CONNECTED);
-    drawBatteryIcon(g, 208, 1, bat, C_BG);
+    drawBatteryIcon(g, 206, 1, bat, C_BG);
     g.drawFastHLine(0, 11, 240, C_HDR);
 
     if (s.n == 0) {
@@ -421,7 +460,7 @@ inline void drawAccounts(M5Canvas &g, const Snapshot &s, int scroll, int bat)
     snprintf(title, sizeof(title), "CONTAS  %s", s.acct[0] ? s.acct : "-");
     g.setTextColor(C_ACC, C_BG);
     g.drawString(title, 4, 1);
-    drawBatteryIcon(g, 208, 1, bat, C_BG);
+    drawBatteryIcon(g, 206, 1, bat, C_BG);
     g.drawFastHLine(0, 11, 240, C_HDR);
 
     if (s.accN == 0) {
@@ -524,7 +563,7 @@ inline void drawStrats(M5Canvas &g, const Snapshot &s, int bat)
     snprintf(title, sizeof(title), "ESTRATEGIAS  %d", s.stN);
     g.setTextColor(C_ACC, C_BG);
     g.drawString(title, 4, 1);
-    drawBatteryIcon(g, 208, 1, bat, C_BG);
+    drawBatteryIcon(g, 206, 1, bat, C_BG);
     g.drawFastHLine(0, 11, 240, C_HDR);
 
     if (s.stN == 0) {
@@ -578,7 +617,7 @@ inline void drawExecs(M5Canvas &g, const Snapshot &s, int bat)
     snprintf(title, sizeof(title), "EXECUCOES  %d", s.exN);
     g.setTextColor(C_ACC, C_BG);
     g.drawString(title, 4, 1);
-    drawBatteryIcon(g, 208, 1, bat, C_BG);
+    drawBatteryIcon(g, 206, 1, bat, C_BG);
     g.drawFastHLine(0, 11, 240, C_HDR);
 
     if (s.exN == 0) {
@@ -605,7 +644,7 @@ inline void drawExecs(M5Canvas &g, const Snapshot &s, int bat)
         g.drawString(sq, 108, y);
 
         char px[16];
-        snprintf(px, sizeof(px), "%.2f", e.px);
+        fmtPrice(px, sizeof(px), e.px, e.dec);
         g.setTextColor(C_TEXT, C_BG);
         g.drawString(px, 236 - g.textWidth(px), y);
     }
@@ -633,20 +672,20 @@ inline void drawHelp(M5Canvas &g, int hpage, int bat)
         "esta ajuda"
     };
 
-    static const char *k1[] = { "TAB", "D", "; .", "ENTER", "T", "B", "C", "K", "X" };
+    static const char *k1[] = { "TAB", "D", "; .", "ENTER", "T", "M", "B", "C", "X" };
     static const char *d1[] = {
         "troca de contrato",
         "grafico: 10min / sessao",
         "rolam listas e paginas",
         "atualiza agora",
         "troca o tema visual",
+        "som: mudo / posicao / tudo",
         "apaga a tela, segue rodando",
-        "configura a rede",
-        "define o token",
+        "configura rede (K = token)",
         "ZERAR TUDO (ENTER confirma)"
     };
 
-    static const char *k2[] = { "faixa", "bolinha", "seta", "cinza", "-----", "borda", "N ORD", "rodape", "" };
+    static const char *k2[] = { "faixa", "bolinha", "seta", "cinza", "-----", "borda", "N ORD", "rodape", "2 graves" };
     static const char *d2[] = {
         "contratos, cor = dia",
         "elo com o PC e sinal",
@@ -656,7 +695,7 @@ inline void drawHelp(M5Canvas &g, int hpage, int bat)
         "piscando = alerta cruzado",
         "ordens neste contrato",
         "abertura, max, min e o dia",
-        ""
+        "som: perdeu o PC"
     };
 
     const char **kk = (hpage == 0) ? k0 : (hpage == 1 ? k1 : k2);
@@ -670,7 +709,7 @@ inline void drawHelp(M5Canvas &g, int hpage, int bat)
     snprintf(title, sizeof(title), "AJUDA  %d/%d  %s", hpage + 1, HELP_PAGES, titulos[hpage]);
     g.setTextColor(C_ACC, C_BG);
     g.drawString(title, 4, 1);
-    drawBatteryIcon(g, 208, 1, bat, C_BG);
+    drawBatteryIcon(g, 206, 1, bat, C_BG);
     g.drawFastHLine(0, 11, 240, C_HDR);
 
     for (int i = 0; i < 9; i++) {
@@ -706,7 +745,7 @@ inline void drawPositions(M5Canvas &g, const Snapshot &s, int bat)
     snprintf(title, sizeof(title), "POSICOES ABERTAS  %d", s.poN);
     g.setTextColor(C_ACC, C_BG);
     g.drawString(title, 4, 1);
-    drawBatteryIcon(g, 208, 1, bat, C_BG);
+    drawBatteryIcon(g, 206, 1, bat, C_BG);
     g.drawFastHLine(0, 11, 240, C_HDR);
 
     if (s.poN == 0) {
@@ -745,7 +784,7 @@ inline void drawPositions(M5Canvas &g, const Snapshot &s, int bat)
         g.drawString(ac, 90, y);
 
         char av[16];
-        snprintf(av, sizeof(av), "%.2f", p.avg);
+        fmtPrice(av, sizeof(av), p.avg, p.dec);
         g.setTextColor(C_TEXT, C_BG);
         g.drawString(av, 172 - g.textWidth(av), y);
 
@@ -771,7 +810,7 @@ inline void drawOrders(M5Canvas &g, const Snapshot &s, int bat)
     snprintf(title, sizeof(title), "ORDENS ABERTAS  %d", s.odN);
     g.setTextColor(C_ACC, C_BG);
     g.drawString(title, 4, 1);
-    drawBatteryIcon(g, 208, 1, bat, C_BG);
+    drawBatteryIcon(g, 206, 1, bat, C_BG);
     g.drawFastHLine(0, 11, 240, C_HDR);
 
     if (s.odN == 0) {
@@ -812,7 +851,7 @@ inline void drawOrders(M5Canvas &g, const Snapshot &s, int bat)
         g.drawString(ac, 158, y);
 
         char px[16];
-        snprintf(px, sizeof(px), "%.2f", o.px);
+        fmtPrice(px, sizeof(px), o.px, o.dec);
         g.setTextColor(C_TEXT, C_BG);
         g.drawString(px, 236 - g.textWidth(px), y);
     }
@@ -882,14 +921,17 @@ inline void drawPanic(M5Canvas &g, int stage, bool ok, const char *msg, int seco
 // ===============================================================
 //  Tela de status
 // ===============================================================
+inline const char *somNome(int m) { return (m <= 0) ? "mudo" : (m == 1 ? "posicao" : "tudo"); }
+
 inline void drawStatus(M5Canvas &g, const Settings &st, const Snapshot &s, bool wifi, int bat)
 {
     g.fillScreen(C_BG);
     g.setFont(&fonts::Font0);
     g.setTextColor(C_ACC2, C_BG);
     g.drawString("CARDPUTER://trader", 4, 1);
+    drawSoundIcon(g, 178, 1, st.sound);
     drawWifiBars(g, 192, 1, (int)WiFi.RSSI(), wifi);
-    drawBatteryIcon(g, 208, 1, bat, C_BG);
+    drawBatteryIcon(g, 206, 1, bat, C_BG);
     g.drawFastHLine(0, 11, 240, C_HDR);
 
     g.setFont(&fonts::Font2);
@@ -904,8 +946,9 @@ inline void drawStatus(M5Canvas &g, const Settings &st, const Snapshot &s, bool 
     snprintf(line, sizeof(line), "IP: %s", wifi ? WiFi.localIP().toString().c_str() : "-");
     g.drawString(line, 4, 52);
     snprintf(line, sizeof(line), "Bridge: %s:%d", st.host, st.port);           g.drawString(line, 4, 64);
-    snprintf(line, sizeof(line), "Config: %s   Tema: %s",
-             st.configured ? "aparelho" : (st.fromSd ? "SD" : "compilada"), TH.name);
+    snprintf(line, sizeof(line), "Config: %s   Tema: %s   Som: %s",
+             st.configured ? "aparelho" : (st.fromSd ? "SD" : "compilada"), TH.name,
+             somNome(st.sound));
     g.drawString(line, 4, 76);
     snprintf(line, sizeof(line), "Conta: %s (%d)   Token: %s",
              s.acct[0] ? s.acct : "-", s.nAcc, st.token[0] ? "armado" : "off");

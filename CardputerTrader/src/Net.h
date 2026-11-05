@@ -292,6 +292,7 @@ inline bool fetchSnapshot(const Settings &s, Snapshot &snap)
         PosInfo &pi = snap.po[snap.poN];
         snprintf(pi.sym,  sizeof(pi.sym),  "%s", d["sym"]  | "?");
         snprintf(pi.acct, sizeof(pi.acct), "%s", d["acct"] | "");
+        pi.dec = d["dec"] | 2;
         pi.qty = d["qty"] | 0;
         pi.avg = d["avg"] | 0.0f;
         pi.upl = d["upl"] | 0.0f;
@@ -308,6 +309,7 @@ inline bool fetchSnapshot(const Settings &s, Snapshot &snap)
         snprintf(oi.act, sizeof(oi.act), "%s", d["act"] | "");
         snprintf(oi.typ, sizeof(oi.typ), "%s", d["typ"] | "");
         snprintf(oi.st,  sizeof(oi.st),  "%s", d["st"]  | "");
+        oi.dec = d["dec"] | 2;
         oi.qty = d["qty"] | 0;
         oi.px  = d["px"]  | 0.0f;
         snap.odN++;
@@ -322,6 +324,7 @@ inline bool fetchSnapshot(const Settings &s, Snapshot &snap)
         snprintf(ei.sym, sizeof(ei.sym), "%s", x["sym"] | "");
         const char *sd = x["side"] | "?";
         ei.side = sd[0];
+        ei.dec = x["dec"] | 2;
         ei.qty = x["qty"] | 0;
         ei.px  = x["px"]  | 0.0f;
         snap.exN++;

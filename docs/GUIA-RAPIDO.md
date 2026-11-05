@@ -37,6 +37,7 @@ Apertar a mesma tecla de novo volta ao painel. Não existe caminho de volta para
 | Tecla | Ação |
 |---|---|
 | `T` | troca o tema: neon → âmbar → matrix |
+| `M` | som: mudo → posição → tudo |
 | `B` | apaga a tela sem parar nada |
 | `C` | refaz a configuração de rede |
 | `K` | define o token de emergência |
@@ -65,6 +66,29 @@ Painel de configuração em `localhost:8088`, ou **Control Center → Tools → 
 
 Contas simuladas e desconectadas ficam fora do cálculo por padrão; os dois dropdowns permitem incluir. Ali você também troca a conta, os contratos, os alertas e o token. Vale na hora, sem recompilar. A seção *Contas consideradas* mostra o que está entrando no cálculo — é o primeiro lugar a olhar quando algo não aparece.
 
+## Alertas sonoros
+
+| Som | Quando |
+|---|---|
+| dois tons subindo | abriu posição comprada |
+| dois tons descendo | abriu posição vendida |
+| um grave longo | zerou a posição |
+| clique agudo | aumentou a posição |
+| clique médio | reduziu a posição |
+| três agudos rápidos | preço cruzou um alerta |
+| dois graves | perdeu contato com o PC |
+| dois médios subindo | contato restabelecido |
+
+A tecla `M` alterna entre **mudo**, **posição** (só os eventos de posição) e **tudo** (inclui os alertas de preço). A escolha fica salva.
+
+O aviso de contato perdido dispara depois de **30 segundos** sem resposta e se repete a cada 5 minutos enquanto durar — assim o silêncio deixa de ser ambíguo quando você está com a tela apagada.
+
+O som toca mesmo com a tela apagada — dá para deixar o Cardputer no bolso ou na mesa e ouvir quando uma estratégia entrou.
+
 ## Economia de bateria
 
 Escurece em 1 minuto parado, apaga em 5. Qualquer tecla acorda, e essa primeira tecla só desperta — não dispara ação nenhuma.
+
+**Com a tela apagada ele continua monitorando**, e o som continua tocando. Se o som estiver ligado, a consulta se mantém em 1 segundo para o alerta não atrasar. Só no modo mudo ela cai para 4 segundos.
+
+A tela apagada rende cerca de uma hora a mais de autonomia. O grosso do consumo é o rádio Wi-Fi, que fica ligado de qualquer forma — espere de 10 a 13 horas.

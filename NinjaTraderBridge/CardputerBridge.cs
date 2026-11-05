@@ -55,6 +55,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         private const int DAY_MAX            = 2880;     // 24 h de pontos
         private const int DAY_SEND           = 160;      // pontos enviados ao Cardputer
         private const int EXEC_MAX           = 10;       // ultimas execucoes
+        private const int TAIL_REFRESH_MS    = 2000;     // posicoes, ordens, execucoes
         private const int ROLL_CHECK_MS      = 3600000;  // 1 h
         private const int DISCOVERY_PORT     = 8089;     // broadcast: o Cardputer acha o PC sozinho
 
@@ -590,6 +591,245 @@ namespace NinjaTrader.NinjaScript.AddOns
             }
         }
 
+
+        // =============================================================
+        //  Parte pesada do JSON: posicoes, ordens, estrategias e
+        //  execucoes. Varrer isso 2x por segundo com muitas contas
+        //  pesa no NinjaTrader, entao remontamos a cada 2 s e
+        //  reaproveitamos entre uma leitura e outra.
+        // =============================================================
+        private string cachedTail = "\"positions\":[],\"orders\":[],\"strats\":[],\"execs\":[]}";
+        private DateTime lastTailAt = DateTime.MinValue;
+        private readonly Dictionary<string, int> ordersByInstrument = new Dictionary<string, int>();
+        private readonly object tailGate = new object();
+
+        private string TailJson(List<Account> sel)
+        {
+            lock (tailGate)
+            {
+                if ((DateTime.Now - lastTailAt).TotalMilliseconds < TAIL_REFRESH_MS)
+                    return cachedTail;
+                lastTailAt = DateTime.Now;
+            }
+
+            StringBuilder sb = new StringBuilder(8192);
+
+            // indice de ordens por instrumento, usado pelo campo nord
+            Dictionary<string, int> idx = new Dictionary<string, int>();
+            foreach (Account a in sel)
+            {
+                try
+                {
+                    lock (a.Orders)
+                    {
+                        foreach (Order od in a.Orders)
+                        {
+                            if (od == null || od.Instrument == null) continue;
+                            if (od.OrderState != OrderState.Working &&
+                                od.OrderState != OrderState.Accepted) continue;
+                            string key = od.Instrument.FullName;
+                            if (idx.ContainsKey(key)) idx[key]++;
+                            else idx[key] = 1;
+                        }
+                    }
+                }
+                catch { }
+            }
+
+
+                // ---- estrategias rodando ----
+                sb.Append("\"strats\":[");
+                int ns = 0;
+                foreach (Account a in sel)
+                {
+                    List<object> list = new List<object>();
+                    try { lock (a.Strategies) { foreach (object o in a.Strategies) list.Add(o); } }
+                    catch { }
+
+                    foreach (object o in list)
+                    {
+                        StrategyBase sbx = o as StrategyBase;
+                        if (sbx == null) continue;
+                        if (ns > 0) sb.Append(',');
+
+                        string stName = "?", stState = "?";
+                        try { stName = sbx.Name; } catch { }
+                        try { stState = sbx.State.ToString(); } catch { }
+
+                        sb.Append("{\"name\":\"").Append(Esc(stName)).Append("\",");
+                        sb.Append("\"acct\":\"").Append(Esc(a.Name)).Append("\",");
+                        sb.Append("\"state\":\"").Append(Esc(stState)).Append("\"}");
+                        ns++;
+                        if (ns >= 16) break;
+                    }
+                    if (ns >= 16) break;
+                }
+                sb.Append("],");
+
+                // ---- TODAS as posicoes abertas, mesmo de contratos fora da lista ----
+                sb.Append("\"positions\":[");
+                int np = 0;
+                foreach (Account a in sel)
+                {
+                    List<Position> plist = new List<Position>();
+                    try
+                    {
+                        lock (a.Positions)
+                        {
+                            foreach (Position p in a.Positions)
+                                if (p != null && p.MarketPosition != MarketPosition.Flat) plist.Add(p);
+                        }
+                    }
+                    catch { }
+
+                    foreach (Position p in plist)
+                    {
+                        if (np >= 20) break;
+                        if (np > 0) sb.Append(',');
+
+                        string psym = "?";
+                        int pqty = 0;
+                        double pavg = 0, pupl = 0;
+
+                        try { psym = (p.Instrument != null) ? p.Instrument.MasterInstrument.Name : "?"; } catch { }
+                        try { pqty = (p.MarketPosition == MarketPosition.Short) ? -p.Quantity : p.Quantity; } catch { }
+                        try { pavg = p.AveragePrice; } catch { }
+                        int pdec = 2;
+                        try { pdec = DecimalsFromTick(p.Instrument.MasterInstrument.TickSize); } catch { }
+                        // O preco vem so dos contratos assinados. Um contrato
+                        // fora da lista aparece com resultado zerado, nao com
+                        // numero inventado.
+                        try
+                        {
+                            double px = 0;
+                            lock (gate)
+                            {
+                                foreach (Feed ff in feeds)
+                                    if (ff.Instrument != null && p.Instrument != null &&
+                                        ff.Instrument.FullName == p.Instrument.FullName) { px = ff.Last; break; }
+                            }
+                            if (px > 0) pupl = p.GetUnrealizedProfitLoss(PerformanceUnit.Currency, px);
+                        }
+                        catch { }
+
+                        sb.Append("{\"sym\":\"").Append(Esc(psym)).Append("\",");
+                        sb.Append("\"acct\":\"").Append(Esc(a.Name)).Append("\",");
+                        sb.Append("\"qty\":").Append(pqty).Append(',');
+                        sb.Append("\"dec\":").Append(pdec).Append(',');
+                        sb.Append("\"avg\":").Append(N(pavg, pdec)).Append(',');
+                        sb.Append("\"upl\":").Append(N(pupl, 2)).Append('}');
+                        np++;
+                    }
+                    if (np >= 20) break;
+                }
+                sb.Append("],");
+
+                // ---- ordens de trabalho ----
+                sb.Append("\"orders\":[");
+                int no = 0;
+                foreach (Account a in sel)
+                {
+                    List<Order> ords = new List<Order>();
+                    try
+                    {
+                        lock (a.Orders)
+                        {
+                            foreach (Order od in a.Orders)
+                            {
+                                if (od == null) continue;
+                                if (od.OrderState == OrderState.Working ||
+                                    od.OrderState == OrderState.Accepted)
+                                    ords.Add(od);
+                            }
+                        }
+                    }
+                    catch { }
+
+                    foreach (Order od in ords)
+                    {
+                        if (no >= 20) break;
+                        if (no > 0) sb.Append(',');
+
+                        string osym = "?", oact = "?", otyp = "?", ostate = "?";
+                        double opx = 0;
+                        int oqty = 0;
+
+                        try { osym = (od.Instrument != null) ? od.Instrument.MasterInstrument.Name : "?"; } catch { }
+                        try { oact = od.OrderAction.ToString(); } catch { }
+                        try { otyp = od.OrderType.ToString(); } catch { }
+                        try { ostate = od.OrderState.ToString(); } catch { }
+                        try { oqty = od.Quantity; } catch { }
+                        try { opx = (od.LimitPrice > 0) ? od.LimitPrice : od.StopPrice; } catch { }
+                        int odec = 2;
+                        try { odec = DecimalsFromTick(od.Instrument.MasterInstrument.TickSize); } catch { }
+
+                        sb.Append("{\"sym\":\"").Append(Esc(osym)).Append("\",");
+                        sb.Append("\"acct\":\"").Append(Esc(a.Name)).Append("\",");
+                        sb.Append("\"act\":\"").Append(Esc(oact)).Append("\",");
+                        sb.Append("\"typ\":\"").Append(Esc(otyp)).Append("\",");
+                        sb.Append("\"st\":\"").Append(Esc(ostate)).Append("\",");
+                        sb.Append("\"qty\":").Append(oqty).Append(',');
+                        sb.Append("\"dec\":").Append(odec).Append(',');
+                        sb.Append("\"px\":").Append(N(opx, odec)).Append('}');
+                        no++;
+                    }
+                    if (no >= 20) break;
+                }
+                sb.Append("],");
+
+                // ---- ultimas execucoes ----
+                List<Execution> execs = new List<Execution>();
+                foreach (Account a in sel)
+                {
+                    try
+                    {
+                        lock (a.Executions)
+                        {
+                            foreach (Execution ex in a.Executions) if (ex != null) execs.Add(ex);
+                        }
+                    }
+                    catch { }
+                }
+
+                try { execs = execs.OrderByDescending(x => x.Time).Take(EXEC_MAX).ToList(); }
+                catch { if (execs.Count > EXEC_MAX) execs = execs.GetRange(0, EXEC_MAX); }
+
+                sb.Append("\"execs\":[");
+                for (int i = 0; i < execs.Count; i++)
+                {
+                    Execution ex = execs[i];
+                    if (i > 0) sb.Append(',');
+
+                    string esym = "?", eside = "?", etime = "";
+                    double eprice = 0;
+                    int eqty = 0;
+                    try { esym = (ex.Instrument != null) ? ex.Instrument.MasterInstrument.Name : "?"; } catch { }
+                    try { eside = (ex.MarketPosition == MarketPosition.Long) ? "C" : "V"; } catch { }
+                    try { etime = ex.Time.ToString("HH:mm:ss"); } catch { }
+                    try { eprice = ex.Price; } catch { }
+                    try { eqty = ex.Quantity; } catch { }
+                    int edec = 2;
+                    try { edec = DecimalsFromTick(ex.Instrument.MasterInstrument.TickSize); } catch { }
+
+                    sb.Append("{\"t\":\"").Append(Esc(etime)).Append("\",");
+                    sb.Append("\"sym\":\"").Append(Esc(esym)).Append("\",");
+                    sb.Append("\"side\":\"").Append(eside).Append("\",");
+                    sb.Append("\"qty\":").Append(eqty).Append(',');
+                    sb.Append("\"dec\":").Append(edec).Append(',');
+                    sb.Append("\"px\":").Append(N(eprice, edec)).Append('}');
+                }
+            sb.Append("]}");
+
+            string result = sb.ToString();
+            lock (tailGate)
+            {
+                cachedTail = result;
+                ordersByInstrument.Clear();
+                foreach (KeyValuePair<string, int> kv in idx) ordersByInstrument[kv.Key] = kv.Value;
+            }
+            return result;
+        }
+
         // =============================================================
         //  Historico da sessao em disco
         //  Sobrevive a reinicio do NinjaTrader.
@@ -843,25 +1083,20 @@ namespace NinjaTrader.NinjaScript.AddOns
                     int absQty = Math.Abs(netQty);
                     if (absQty > 0 && notion > 0) avgPrice = notion / absQty;
 
-                    // quantas ordens de trabalho existem neste contrato
+                    // ordens deste contrato: vem do indice montado em TailJson
                     int nOrd = 0;
-                    foreach (Account a in sel)
+                    try
                     {
-                        try
+                        if (f.Instrument != null)
                         {
-                            lock (a.Orders)
+                            lock (tailGate)
                             {
-                                foreach (Order od in a.Orders)
-                                {
-                                    if (od == null || od.Instrument == null || f.Instrument == null) continue;
-                                    if (od.OrderState != OrderState.Working &&
-                                        od.OrderState != OrderState.Accepted) continue;
-                                    if (od.Instrument.FullName == f.Instrument.FullName) nOrd++;
-                                }
+                                int v;
+                                if (ordersByInstrument.TryGetValue(f.Instrument.FullName, out v)) nOrd = v;
                             }
                         }
-                        catch { }
                     }
+                    catch { }
 
                     sb.Append("{\"sym\":\"").Append(Esc(resolved)).Append("\",");
                     sb.Append("\"root\":\"").Append(Esc(f.Root)).Append("\",");
@@ -900,179 +1135,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 
                 sb.Append("],");
 
-                // ---- estrategias rodando ----
-                sb.Append("\"strats\":[");
-                int ns = 0;
-                foreach (Account a in sel)
-                {
-                    List<object> list = new List<object>();
-                    try { lock (a.Strategies) { foreach (object o in a.Strategies) list.Add(o); } }
-                    catch { }
-
-                    foreach (object o in list)
-                    {
-                        StrategyBase sbx = o as StrategyBase;
-                        if (sbx == null) continue;
-                        if (ns > 0) sb.Append(',');
-
-                        string stName = "?", stState = "?";
-                        try { stName = sbx.Name; } catch { }
-                        try { stState = sbx.State.ToString(); } catch { }
-
-                        sb.Append("{\"name\":\"").Append(Esc(stName)).Append("\",");
-                        sb.Append("\"acct\":\"").Append(Esc(a.Name)).Append("\",");
-                        sb.Append("\"state\":\"").Append(Esc(stState)).Append("\"}");
-                        ns++;
-                        if (ns >= 16) break;
-                    }
-                    if (ns >= 16) break;
-                }
-                sb.Append("],");
-
-                // ---- TODAS as posicoes abertas, mesmo de contratos fora da lista ----
-                sb.Append("\"positions\":[");
-                int np = 0;
-                foreach (Account a in sel)
-                {
-                    List<Position> plist = new List<Position>();
-                    try
-                    {
-                        lock (a.Positions)
-                        {
-                            foreach (Position p in a.Positions)
-                                if (p != null && p.MarketPosition != MarketPosition.Flat) plist.Add(p);
-                        }
-                    }
-                    catch { }
-
-                    foreach (Position p in plist)
-                    {
-                        if (np >= 20) break;
-                        if (np > 0) sb.Append(',');
-
-                        string psym = "?";
-                        int pqty = 0;
-                        double pavg = 0, pupl = 0;
-
-                        try { psym = (p.Instrument != null) ? p.Instrument.MasterInstrument.Name : "?"; } catch { }
-                        try { pqty = (p.MarketPosition == MarketPosition.Short) ? -p.Quantity : p.Quantity; } catch { }
-                        try { pavg = p.AveragePrice; } catch { }
-                        try
-                        {
-                            double px = 0;
-                            lock (gate)
-                            {
-                                foreach (Feed ff in feeds)
-                                    if (ff.Instrument != null && p.Instrument != null &&
-                                        ff.Instrument.FullName == p.Instrument.FullName) { px = ff.Last; break; }
-                            }
-                            if (px <= 0 && p.Instrument != null) px = p.Instrument.MarketData != null &&
-                                                                     p.Instrument.MarketData.Last != null
-                                                                   ? p.Instrument.MarketData.Last.Price : 0;
-                            if (px > 0) pupl = p.GetUnrealizedProfitLoss(PerformanceUnit.Currency, px);
-                        }
-                        catch { }
-
-                        sb.Append("{\"sym\":\"").Append(Esc(psym)).Append("\",");
-                        sb.Append("\"acct\":\"").Append(Esc(a.Name)).Append("\",");
-                        sb.Append("\"qty\":").Append(pqty).Append(',');
-                        sb.Append("\"avg\":").Append(N(pavg, 4)).Append(',');
-                        sb.Append("\"upl\":").Append(N(pupl, 2)).Append('}');
-                        np++;
-                    }
-                    if (np >= 20) break;
-                }
-                sb.Append("],");
-
-                // ---- ordens de trabalho ----
-                sb.Append("\"orders\":[");
-                int no = 0;
-                foreach (Account a in sel)
-                {
-                    List<Order> ords = new List<Order>();
-                    try
-                    {
-                        lock (a.Orders)
-                        {
-                            foreach (Order od in a.Orders)
-                            {
-                                if (od == null) continue;
-                                if (od.OrderState == OrderState.Working ||
-                                    od.OrderState == OrderState.Accepted)
-                                    ords.Add(od);
-                            }
-                        }
-                    }
-                    catch { }
-
-                    foreach (Order od in ords)
-                    {
-                        if (no >= 20) break;
-                        if (no > 0) sb.Append(',');
-
-                        string osym = "?", oact = "?", otyp = "?", ostate = "?";
-                        double opx = 0;
-                        int oqty = 0;
-
-                        try { osym = (od.Instrument != null) ? od.Instrument.MasterInstrument.Name : "?"; } catch { }
-                        try { oact = od.OrderAction.ToString(); } catch { }
-                        try { otyp = od.OrderType.ToString(); } catch { }
-                        try { ostate = od.OrderState.ToString(); } catch { }
-                        try { oqty = od.Quantity; } catch { }
-                        try { opx = (od.LimitPrice > 0) ? od.LimitPrice : od.StopPrice; } catch { }
-
-                        sb.Append("{\"sym\":\"").Append(Esc(osym)).Append("\",");
-                        sb.Append("\"acct\":\"").Append(Esc(a.Name)).Append("\",");
-                        sb.Append("\"act\":\"").Append(Esc(oact)).Append("\",");
-                        sb.Append("\"typ\":\"").Append(Esc(otyp)).Append("\",");
-                        sb.Append("\"st\":\"").Append(Esc(ostate)).Append("\",");
-                        sb.Append("\"qty\":").Append(oqty).Append(',');
-                        sb.Append("\"px\":").Append(N(opx, 4)).Append('}');
-                        no++;
-                    }
-                    if (no >= 20) break;
-                }
-                sb.Append("],");
-
-                // ---- ultimas execucoes ----
-                List<Execution> execs = new List<Execution>();
-                foreach (Account a in sel)
-                {
-                    try
-                    {
-                        lock (a.Executions)
-                        {
-                            foreach (Execution ex in a.Executions) if (ex != null) execs.Add(ex);
-                        }
-                    }
-                    catch { }
-                }
-
-                try { execs = execs.OrderByDescending(x => x.Time).Take(EXEC_MAX).ToList(); }
-                catch { if (execs.Count > EXEC_MAX) execs = execs.GetRange(0, EXEC_MAX); }
-
-                sb.Append("\"execs\":[");
-                for (int i = 0; i < execs.Count; i++)
-                {
-                    Execution ex = execs[i];
-                    if (i > 0) sb.Append(',');
-
-                    string esym = "?", eside = "?", etime = "";
-                    double eprice = 0;
-                    int eqty = 0;
-                    try { esym = (ex.Instrument != null) ? ex.Instrument.MasterInstrument.Name : "?"; } catch { }
-                    try { eside = (ex.MarketPosition == MarketPosition.Long) ? "C" : "V"; } catch { }
-                    try { etime = ex.Time.ToString("HH:mm:ss"); } catch { }
-                    try { eprice = ex.Price; } catch { }
-                    try { eqty = ex.Quantity; } catch { }
-
-                    sb.Append("{\"t\":\"").Append(Esc(etime)).Append("\",");
-                    sb.Append("\"sym\":\"").Append(Esc(esym)).Append("\",");
-                    sb.Append("\"side\":\"").Append(eside).Append("\",");
-                    sb.Append("\"qty\":").Append(eqty).Append(',');
-                    sb.Append("\"px\":").Append(N(eprice, 4)).Append('}');
-                }
-                sb.Append("]}");
+                sb.Append(TailJson(sel));
                 cachedJson = sb.ToString();
             }
             catch (Exception ex)
@@ -1224,26 +1287,56 @@ namespace NinjaTrader.NinjaScript.AddOns
 
             sb.Append("<!doctype html><html lang=\"pt-br\"><head><meta charset=\"utf-8\">");
             sb.Append("<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">");
-            sb.Append("<title>CardputerBridge</title><style>");
-            sb.Append("body{background:#131316;color:#e8e8ea;font:15px/1.6 system-ui,sans-serif;margin:0;padding:24px}");
-            sb.Append(".w{max-width:640px;margin:0 auto}");
-            sb.Append("h1{font-size:20px;font-weight:500;margin:0 0 4px}");
-            sb.Append(".sub{color:#8a8a92;font-size:13px;margin:0 0 24px}");
-            sb.Append(".card{background:#1c1c21;border:1px solid #2a2a31;border-radius:10px;padding:18px;margin-bottom:16px}");
-            sb.Append("label{display:block;font-size:13px;color:#8a8a92;margin:14px 0 6px}");
-            sb.Append("select,input{width:100%;box-sizing:border-box;background:#131316;color:#e8e8ea;");
-            sb.Append("border:1px solid #33333c;border-radius:6px;padding:9px 10px;font-size:14px}");
-            sb.Append("button{margin-top:18px;background:#00E676;color:#062;border:0;border-radius:6px;");
-            sb.Append("padding:10px 18px;font-size:14px;font-weight:500;cursor:pointer}");
-            sb.Append("table{width:100%;border-collapse:collapse;font-size:13px}");
-            sb.Append("th{text-align:left;color:#8a8a92;font-weight:400;padding:6px 0;border-bottom:1px solid #2a2a31}");
-            sb.Append("td{padding:7px 0;border-bottom:1px solid #232329}");
-            sb.Append(".up{color:#00E676}.dn{color:#FF5252}.dim{color:#8a8a92}");
-            sb.Append(".hint{font-size:12px;color:#6a6a72;margin-top:6px}");
+            sb.Append("<title>CARDPUTER://bridge</title><style>");
+
+            // Paleta identica a do NQ Opening Sniper e ao tema MATRIX do Cardputer
+            sb.Append(":root{--neon:#00FF41;--dim:#009433;--bg:#040A06;--hdr:#061908;");
+            sb.Append("--sep:#0E4A25;--branco:#D1FFDE;--mag:#FF2873;--ambar:#FFC700;--azul:#00E5FF}");
+
+            sb.Append("*{box-sizing:border-box}");
+            sb.Append("body{background:var(--bg);color:var(--neon);margin:0;padding:22px 14px;");
+            sb.Append("font:13px/1.55 Consolas,'Courier New',monospace;font-weight:700}");
+
+            // varredura sutil, como monitor de fosforo
+            sb.Append("body:before{content:'';position:fixed;inset:0;pointer-events:none;z-index:9;");
+            sb.Append("background:repeating-linear-gradient(180deg,rgba(0,0,0,.22) 0 1px,transparent 1px 3px)}");
+
+            sb.Append(".w{max-width:680px;margin:0 auto}");
+            sb.Append("h1{font-size:15px;font-weight:700;margin:0;letter-spacing:1px;color:var(--neon)}");
+            sb.Append(".cur{display:inline-block;width:8px;height:14px;background:var(--neon);");
+            sb.Append("vertical-align:-2px;margin-left:5px;animation:b 1s steps(1) infinite}");
+            sb.Append("@keyframes b{50%{opacity:0}}");
+            sb.Append(".sub{color:var(--dim);margin:4px 0 18px;font-weight:400}");
+
+            sb.Append(".card{background:var(--hdr);border:1px solid var(--sep);padding:14px 16px;margin-bottom:14px}");
+            sb.Append(".ttl{color:var(--azul);font-size:12px;letter-spacing:1px;margin-bottom:12px;");
+            sb.Append("border-bottom:1px solid var(--sep);padding-bottom:6px}");
+
+            sb.Append("label{display:block;font-size:12px;color:var(--dim);margin:14px 0 5px;letter-spacing:.5px}");
+            sb.Append("label:first-of-type{margin-top:0}");
+            sb.Append("select,input{width:100%;background:var(--bg);color:var(--neon);border:1px solid var(--sep);");
+            sb.Append("padding:8px 9px;font:13px Consolas,'Courier New',monospace;font-weight:700;outline:none}");
+            sb.Append("select:focus,input:focus{border-color:var(--neon)}");
+
+            sb.Append("button,.btn{display:inline-block;margin-top:16px;background:transparent;color:var(--neon);");
+            sb.Append("border:1px solid var(--neon);padding:8px 20px;font:13px Consolas,'Courier New',monospace;");
+            sb.Append("font-weight:700;letter-spacing:1px;cursor:pointer;text-decoration:none}");
+            sb.Append("button:hover,.btn:hover{background:var(--neon);color:var(--bg)}");
+            sb.Append(".btn-dn{color:var(--mag);border-color:var(--mag)}");
+            sb.Append(".btn-dn:hover{background:var(--mag);color:var(--bg)}");
+
+            sb.Append("table{width:100%;border-collapse:collapse;font-size:12px}");
+            sb.Append("th{text-align:left;color:var(--dim);font-weight:400;padding:5px 0;");
+            sb.Append("border-bottom:1px solid var(--sep);letter-spacing:.5px}");
+            sb.Append("td{padding:6px 0;border-bottom:1px solid #072012;color:var(--branco);font-weight:400}");
+
+            sb.Append(".up{color:var(--neon)}.dn{color:var(--mag)}.dim{color:var(--dim);font-weight:400}");
+            sb.Append(".hint{font-size:11px;color:var(--dim);margin-top:5px;font-weight:400}");
+            sb.Append("code{color:var(--ambar);font-weight:700}");
             sb.Append("</style></head><body><div class=\"w\">");
 
-            sb.Append("<h1>CardputerBridge</h1>");
-            sb.Append("<p class=\"sub\">Ajuste conta e contratos. As mudancas valem na hora, sem recompilar.</p>");
+            sb.Append("<h1>CARDPUTER://bridge<span class=\"cur\"></span></h1>");
+            sb.Append("<p class=\"sub\">&gt; conta e contratos valem na hora, sem recompilar</p>");
 
             // ---- formulario ----
             sb.Append("<form class=\"card\" method=\"get\" action=\"/set\">");
@@ -1300,12 +1393,12 @@ namespace NinjaTrader.NinjaScript.AddOns
             sb.Append("<p class=\"hint\">Em branco desativa os comandos de zerar posicao. ");
             sb.Append("O mesmo valor precisa estar no Cardputer (assistente, passo 4).</p>");
 
-            sb.Append("<button type=\"submit\">Salvar e reassinar</button>");
+            sb.Append("<button type=\"submit\">SALVAR E REASSINAR</button>");
             sb.Append("</form>");
 
             // ---- comandos de emergencia ----
             sb.Append("<div class=\"card\">");
-            sb.Append("<div style=\"font-size:13px;color:#8a8a92;margin-bottom:10px\">Emergencia</div>");
+            sb.Append("<div class=\"ttl\">[ EMERGENCIA ]</div>");
 
             if (string.IsNullOrEmpty(cfgToken))
             {
@@ -1314,16 +1407,13 @@ namespace NinjaTrader.NinjaScript.AddOns
             else
             {
                 string t = Uri.EscapeDataString(cfgToken);
-                sb.Append("<a href=\"/panic?ui=1&t=").Append(t).Append("\" ");
-                sb.Append("onclick=\"return confirm('Zerar TODAS as posicoes, cancelar ordens e desligar estrategias?')\" ");
-                sb.Append("style=\"display:inline-block;background:#FF5252;color:#3b0000;text-decoration:none;");
-                sb.Append("padding:10px 18px;border-radius:6px;font-weight:500\">Zerar tudo</a>");
+                sb.Append("<a class=\"btn btn-dn\" href=\"/panic?ui=1&t=").Append(t).Append("\" ");
+                sb.Append("onclick=\"return confirm('Zerar TODAS as posicoes, cancelar ordens e desligar estrategias?')\"");
+                sb.Append(">ZERAR TUDO</a>");
 
-                sb.Append("<a href=\"/killstrats?ui=1&t=").Append(t).Append("\" ");
-                sb.Append("onclick=\"return confirm('Desligar todas as estrategias?')\" ");
-                sb.Append("style=\"display:inline-block;margin-left:10px;background:transparent;color:#e8e8ea;");
-                sb.Append("border:1px solid #33333c;text-decoration:none;padding:10px 18px;border-radius:6px\">");
-                sb.Append("So estrategias</a>");
+                sb.Append("<a class=\"btn\" style=\"margin-left:10px\" href=\"/killstrats?ui=1&t=").Append(t).Append("\" ");
+                sb.Append("onclick=\"return confirm('Desligar todas as estrategias?')\"");
+                sb.Append(">SO ESTRATEGIAS</a>");
 
                 sb.Append("<p class=\"hint\">Vale para as contas do filtro acima. Confira o resultado no Control Center.</p>");
             }
@@ -1331,7 +1421,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 
             // ---- estado atual ----
             sb.Append("<div class=\"card\"><table>");
-            sb.Append("<tr><th>Contrato</th><th>Ultimo</th><th>Variacao</th><th>Posicao</th></tr>");
+            sb.Append("<tr><th>CONTRATO</th><th>ULTIMO</th><th>VAR</th><th>POS</th></tr>");
 
             List<Feed> snap;
             lock (gate) { snap = feeds.ToList(); }
@@ -1384,16 +1474,16 @@ namespace NinjaTrader.NinjaScript.AddOns
 
             // diagnostico: quais contas entram na conta
             sb.Append("<div class=\"card\">");
-            sb.Append("<div style=\"font-size:13px;color:#8a8a92;margin-bottom:8px\">Contas consideradas</div>");
+            sb.Append("<div class=\"ttl\">[ CONTAS CONSIDERADAS ]</div>");
             List<Account> selNow = SelectedAccounts();
             if (selNow.Count == 0)
             {
-                sb.Append("<p class=\"dn\" style=\"margin:0\">Nenhuma. Posicoes e PnL vao aparecer vazios. ");
-                sb.Append("Se voce esta testando em conta simulada, mude o filtro acima para incluir.</p>");
+                sb.Append("<p class=\"dn\" style=\"margin:0\">Nenhuma conta ativa. Posicoes e PnL ficam vazios.<br>");
+                sb.Append("Contas simuladas e desconectadas saem por padrao: ajuste os filtros acima.</p>");
             }
             else
             {
-                sb.Append("<table><tr><th>Conta</th><th>Posicoes</th><th>Ordens</th></tr>");
+                sb.Append("<table><tr><th>CONTA</th><th>POS</th><th>ORD</th></tr>");
                 foreach (Account a in selNow)
                 {
                     int pc = 0, oc = 0;
@@ -1404,25 +1494,11 @@ namespace NinjaTrader.NinjaScript.AddOns
                 }
                 sb.Append("</table>");
             }
-            List<Account> hidden = AllAccounts().Where(a => IsIgnored(a)).ToList();
-            if (hidden.Count > 0)
-            {
-                sb.Append("<p class=\"hint\">Ignoradas: ");
-                for (int i = 0; i < hidden.Count; i++)
-                {
-                    if (i > 0) sb.Append(", ");
-                    bool online = false;
-                    try { online = (hidden[i].Connection != null); } catch { }
-                    sb.Append(Html(hidden[i].Name));
-                    sb.Append(online ? " <span class=\"dim\">(simulada)</span>"
-                                     : " <span class=\"dim\">(desconectada)</span>");
-                }
-                sb.Append("</p>");
-            }
             sb.Append("</div>");
 
-            sb.Append("<div class=\"card\"><p class=\"dim\" style=\"margin:0\">Dados para o Cardputer: ");
-            sb.Append("<code>/quote</code> &nbsp;|&nbsp; Config salva em <code>").Append(Html(cfgPath)).Append("</code></p></div>");
+            sb.Append("<p class=\"dim\" style=\"margin:14px 0 0\">&gt; dados: <code>/quote</code>");
+            sb.Append(" &middot; historico: <code>/hist</code> &middot; config: <code>");
+            sb.Append(Html(cfgPath)).Append("</code></p>");
 
             sb.Append("<script>setTimeout(function(){location.reload()},5000)</script>");
             sb.Append("</div></body></html>");

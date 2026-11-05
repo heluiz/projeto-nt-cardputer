@@ -17,6 +17,7 @@
 //    T      troca o tema
 //    C      refaz a configuracao de rede
 //    K      define o token de emergencia
+//    M      som: mudo / posicao / tudo
 //    B      liga/desliga a tela
 //    X      ZERAR TUDO (confirma com ENTER)
 //    ENTER  atualiza agora
@@ -35,6 +36,7 @@
 #include "Ui.h"
 #include "Boot.h"
 #include "Setup.h"
+#include "Sound.h"
 
 // --- economia de bateria ---
 #define IDLE_DIM_MS   60000UL
@@ -69,6 +71,11 @@ static char     symWanted[20] = "";   // acompanha o contrato mesmo se a lista m
 static int      page      = PG_STATUS;
 static int      accScroll = 0;
 static int      helpPage  = 0;
+static PositionWatcher posWatch;
+static volatile int soundQueue = SND_NONE;
+static bool     linkLost   = false;
+static uint32_t lastOkAt   = 0;
+static uint32_t lastLostBeep = 0;
 static bool     dayMode   = false;
 static bool     screenOn  = true;
 static bool     canvasOk  = false;
@@ -164,15 +171,46 @@ static void netTask(void *arg)
         bool got = fetchSnapshot(settings, snapStage);
         if (!got) snapStage.ok = false;
 
+        if (got) {
+            int ev = posWatch.diff(snapStage);
+            if (ev == SND_NONE && posWatch.alertEdge(snapStage)) ev = SND_ALERT;
+            if (ev != SND_NONE) soundQueue = ev;
+        }
+
         if (xSemaphoreTake(dataMux, portMAX_DELAY) == pdTRUE) {
             memcpy(&snap, &snapStage, sizeof(Snapshot));
             xSemaphoreGive(dataMux);
         }
 
         // backoff progressivo, para nao martelar a rede com a bridge fora
+        // --- aviso sonoro de elo perdido e recuperado ---
+        uint32_t agora = millis();
+        if (got) {
+            lastOkAt = agora;
+            if (linkLost) {
+                linkLost = false;
+                soundQueue = SND_BACK;
+            }
+        } else {
+            if (!linkLost && agora - lastOkAt > LINK_LOST_MS) {
+                linkLost = true;
+                lastLostBeep = agora;
+                soundQueue = SND_ERROR;
+            } else if (linkLost && agora - lastLostBeep > LINK_REBEEP_MS) {
+                lastLostBeep = agora;
+                soundQueue = SND_ERROR;
+            }
+        }
+
         if (got) {
             fails = 0;
-            interval = (dimLevel == 2 || !screenOn) ? CFG_POLL_SLOW_MS : CFG_POLL_MS;
+            bool telaApagada = (dimLevel == 2 || !screenOn);
+
+            // Com o som ligado, a tela apagada NAO afrouxa o ritmo: o alerta
+            // de entrada precisa ser rapido, e quem gasta bateria e o radio
+            // Wi-Fi ficar associado, nao a frequencia da consulta.
+            if (telaApagada && settings.sound == 0) interval = CFG_POLL_SLOW_MS;
+            else                                    interval = CFG_POLL_MS;
         } else {
             fails++;
             interval = CFG_POLL_MS << (fails > 5 ? 5 : fails);
@@ -222,7 +260,7 @@ static void render()
         syncSymbol();
 
         switch (page) {
-            case PG_GRID:   drawGrid(canvas, snap, symIdx, connOk, bat); break;
+            case PG_GRID:   drawGrid(canvas, snap, symIdx, connOk, bat, settings.sound); break;
             case PG_ACCTS:  drawAccounts(canvas, snap, accScroll, bat); break;
             case PG_STRATS: drawStrats(canvas, snap, bat); break;
             case PG_EXECS:  drawExecs(canvas, snap, bat); break;
@@ -232,11 +270,11 @@ static void render()
             case PG_STATUS: drawStatus(canvas, settings, snap, wifi, bat); break;
             case PG_CHART:
                 if (snap.n == 0) drawStatus(canvas, settings, snap, wifi, bat);
-                else drawChart(canvas, snap, symIdx, dayHist, dayMode, connOk, bat);
+                else drawChart(canvas, snap, symIdx, dayHist, dayMode, connOk, bat, settings.sound);
                 break;
             default:
                 if (snap.n == 0) drawStatus(canvas, settings, snap, wifi, bat);
-                else drawDashboard(canvas, snap, symIdx, connOk, bat, age);
+                else drawDashboard(canvas, snap, symIdx, connOk, bat, age, settings.sound);
                 break;
         }
     }
@@ -367,6 +405,14 @@ static void handleKeys()
                 render();
                 break;
 
+            case 'm':
+                settings.sound = (settings.sound + 1) % 3;
+                saveSoundToNvs(settings.sound);
+                soundSetMode(settings.sound);
+                if (settings.sound > 0) soundPlay(SND_ADD, settings.sound);
+                render();
+                break;
+
             case 'x':
                 panicMode = true;
                 panicStage = 0;
@@ -490,6 +536,9 @@ void setup()
         boot.step("carteira", det, 1);
     }
 
+    soundBegin(settings.sound);
+    boot.step("som", soundModeName(settings.sound), settings.sound > 0 ? 1 : 3);
+
     boot.step("token", settings.token[0] ? "armado" : "desativado",
               settings.token[0] ? 1 : 3);
 
@@ -497,6 +546,7 @@ void setup()
     delay(got ? 1300 : 2400);
 
     memcpy(&snapStage, &snap, sizeof(Snapshot));
+    lastOkAt = millis();
 
     // ---- tarefa de rede no nucleo 0 ----
     xTaskCreatePinnedToCore(netTask, "net", 8192, nullptr, 1, &netTaskHandle, 0);
@@ -513,6 +563,12 @@ void loop()
 {
     M5Cardputer.update();
     handleKeys();
+
+    if (soundQueue != SND_NONE) {
+        int ev = soundQueue;
+        soundQueue = SND_NONE;
+        soundPlay(ev, settings.sound);
+    }
 
     uint32_t now = millis();
 

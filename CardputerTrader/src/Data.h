@@ -39,6 +39,7 @@ struct StratInfo {
 struct PosInfo {
     char  sym[10]  = "";
     char  acct[20] = "";
+    int   dec      = 2;
     int   qty      = 0;
     float avg      = 0;
     float upl      = 0;
@@ -47,6 +48,7 @@ struct PosInfo {
 struct OrderInfo {
     char  sym[10]  = "";
     char  acct[20] = "";
+    int   dec      = 2;
     char  act[12] = "";     // Buy, Sell, BuyToCover, SellShort
     char  typ[12] = "";     // Limit, StopMarket, ...
     char  st[12]  = "";     // Working, Accepted
@@ -57,6 +59,7 @@ struct OrderInfo {
 struct ExecInfo {
     char  t[10]   = "";
     char  sym[10] = "";
+    int   dec     = 2;
     char  side    = '?';
     int   qty     = 0;
     float px      = 0;
@@ -95,6 +98,7 @@ struct Settings {
     int  port     = CFG_PORT;
     char token[40] = "";
     int  theme    = 0;
+    int  sound    = 1;          // 0 mudo, 1 posicao, 2 posicao + alertas
     bool fromSd   = false;
     bool configured = false;
 };

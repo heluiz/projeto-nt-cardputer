@@ -33,6 +33,7 @@ inline bool loadSettingsFromNvs(Settings &s)
         prefs.getString("token", s.token, sizeof(s.token));
         s.port = prefs.getInt("port", CFG_PORT);
         s.theme = prefs.getInt("theme", 0);
+        s.sound = prefs.getInt("sound", 1);
         s.configured = true;
     }
     prefs.end();
@@ -48,6 +49,7 @@ inline void saveSettingsToNvs(const Settings &s)
     prefs.putString("token", s.token);
     prefs.putInt("port", s.port);
     prefs.putInt("theme", s.theme);
+    prefs.putInt("sound", s.sound);
     prefs.putBool("done", true);
     prefs.end();
 }
@@ -145,6 +147,13 @@ inline bool textInput(M5Canvas &g, const char *title, const char *label,
         g.pushSprite(0, 0);
         delay(10);
     }
+}
+
+inline void saveSoundToNvs(int mode)
+{
+    if (!prefs.begin("cardtrader", false)) return;
+    prefs.putInt("sound", mode);
+    prefs.end();
 }
 
 inline void saveTokenToNvs(const char *token)

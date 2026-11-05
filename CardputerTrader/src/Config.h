@@ -16,6 +16,11 @@
 #define CFG_POLL_MAX_MS     30000   // teto do backoff quando a bridge nao responde
 #define CFG_HTTP_TIMEOUT_MS 2500
 
+// Quanto tempo sem resposta antes de avisar que perdeu o PC,
+// e de quanto em quanto tempo repetir o aviso enquanto durar.
+#define LINK_LOST_MS    30000
+#define LINK_REBEEP_MS  300000
+
 #define MAX_QUOTES      10
 #define MAX_ACCOUNTS    24
 #define MAX_SPARK       120
